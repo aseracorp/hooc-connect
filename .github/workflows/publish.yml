@@ -26,22 +26,50 @@ jobs:
           tar -xzf /tmp/crane.tar.gz -C /usr/local/bin crane
           crane version
 
-      - name: Download HOOC connect images
+      - name: Download HOOC connect images (5 platforms, x86 best-effort)
         env:
-          HOOC_TOKEN: ${{ secrets.HOOC_ACCESS_TOKEN }}
+          TOKEN1: ${{ secrets.HOOC_ACCESS_TOKEN }}
+          TOKEN2: ${{ secrets.HOOC_ACCESS_TOKEN2 }}
         run: |
+          set -euo pipefail
           mkdir -p work && cd work
-          for a in ARM_V8 ARM_V7 ARM_V6; do
-            curl -L --fail -sS -o "HOOC_${a}.tar" "https://api.hooc.me/embedded-gateway/v1/binary?arch=${a}&os=LINUX&package=DOCKER_IMAGE&access_token=${HOOC_TOKEN}"
-            echo "fetched ${a}: $(stat -c%s "HOOC_${a}.tar") bytes"
-          done
+          fetch() {
+            local arch="$1" out="$2"
+            for tok in "$TOKEN1" "$TOKEN2"; do
+              if [ -n "$tok" ] && curl -L --fail -sS -o "$out" "https://api.hooc.me/embedded-gateway/v1/binary?arch=${arch}&os=LINUX&package=DOCKER_IMAGE&access_token=${tok}"; then
+                echo "fetched ${arch}: $(stat -c%s "$out") bytes"
+                return 0
+              fi
+            done
+            return 1
+          }
+          fetch ARM_V8 HOOC_ARM_V8.tar
+          fetch ARM_V7 HOOC_ARM_V7.tar
+          fetch ARM_V6 HOOC_ARM_V6.tar
+          if ! fetch AMD64 HOOC_AMD64.tar; then echo "AMD64 failed to download"; exit 1; fi
+          # 32-bit x86: Hooc API currently returns 422 for X86 / 486_CX8 ("Packaging as docker image failed").
+          # Keep it best-effort so the index automatically gains linux/386 when upstream fixes it.
+          if fetch X86 HOOC_X86.tar; then
+            echo "X86 available"
+            echo "X86_OK=true" >> "$GITHUB_ENV"
+          else
+            echo "X86 not available from Hooc yet (skipping linux/386)"
+            echo "X86_OK=false" >> "$GITHUB_ENV"
+          fi
 
       - name: Patch platform variants
         run: |
           cd work
           python3 - <<'PYEOF'
-          import tarfile, json, io
-          archmap = {'ARM_V8': ('arm64', None), 'ARM_V7': ('arm', 'v7'), 'ARM_V6': ('arm', 'v6')}
+          import tarfile, json, io, os
+          archmap = {
+              'ARM_V8':  ('arm64', None),
+              'ARM_V7':  ('arm', 'v7'),
+              'ARM_V6':  ('arm', 'v6'),
+              'AMD64':   ('amd64', None),
+          }
+          if os.path.exists('HOOC_X86.tar'):
+              archmap['X86'] = ('386', None)
           for arch, (a, v) in archmap.items():
               src = f'HOOC_{arch}.tar'; dst = f'patched_{arch}.tar'
               t = tarfile.open(src, 'r')
@@ -66,14 +94,25 @@ jobs:
         env:
           REG: ghcr.io/aseracorp/hooc-connect
           V: ${{ github.event.inputs.version }}
+          X86_OK: ${{ env.X86_OK }}
         run: |
+          set -euo pipefail
           cd work
           crane auth login ghcr.io -u "${{ github.actor }}" --password-stdin <<< "${{ secrets.GITHUB_TOKEN }}"
-          crane push patched_ARM_V8.tar "$REG:arm64-$V"
-          crane push patched_ARM_V7.tar "$REG:armv7-$V"
-          crane push patched_ARM_V6.tar "$REG:armv6-$V"
-          crane index append --docker-empty-base -m "$REG:arm64-$V" -m "$REG:armv7-$V" -m "$REG:armv6-$V" -t "$REG:$V"
-          crane index append --docker-empty-base -m "$REG:arm64-$V" -m "$REG:armv7-$V" -m "$REG:armv6-$V" -t "$REG:latest"
+          MANIFESTS=()
+          crane push patched_ARM_V8.tar "$REG:arm64-$V";   MANIFESTS+=("$REG:arm64-$V")
+          crane push patched_ARM_V7.tar "$REG:armv7-$V";   MANIFESTS+=("$REG:armv7-$V")
+          crane push patched_ARM_V6.tar "$REG:armv6-$V";   MANIFESTS+=("$REG:armv6-$V")
+          crane push patched_AMD64.tar "$REG:amd64-$V";    MANIFESTS+=("$REG:amd64-$V")
+          if [ -f patched_X86.tar ] && [ "$X86_OK" = "true" ]; then
+            crane push patched_X86.tar "$REG:x86-$V"
+            MANIFESTS+=("$REG:x86-$V")
+          fi
+          ARGS=()
+          for m in "${MANIFESTS[@]}"; do ARGS+=(-m "$m"); done
+          echo "Building index for: ${MANIFESTS[*]}"
+          crane index append --docker-empty-base "${ARGS[@]}" -t "$REG:$V"
+          crane index append --docker-empty-base "${ARGS[@]}" -t "$REG:latest"
 
       - name: Ensure package is public
         run: |
