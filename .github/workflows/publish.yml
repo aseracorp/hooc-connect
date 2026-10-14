@@ -1,0 +1,85 @@
+name: Publish multi-arch image
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version tag (e.g. 1.1.0)'
+        required: true
+        default: '1.1.0'
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install crane
+        run: |
+          curl -sSL -o /tmp/crane.tar.gz https://github.com/google/go-containerregistry/releases/download/v0.22.1/go-containerregistry_Linux_x86_64.tar.gz
+          tar -xzf /tmp/crane.tar.gz -C /usr/local/bin crane
+          crane version
+
+      - name: Download HOOC connect images
+        env:
+          HOOC_TOKEN: ${{ secrets.HOOC_ACCESS_TOKEN }}
+        run: |
+          mkdir -p work && cd work
+          for a in ARM_V8 ARM_V7 ARM_V6; do
+            curl -L --fail -sS -o "HOOC_${a}.tar" "https://api.hooc.me/embedded-gateway/v1/binary?arch=${a}&os=LINUX&package=DOCKER_IMAGE&access_token=${HOOC_TOKEN}"
+            echo "fetched ${a}: $(stat -c%s "HOOC_${a}.tar") bytes"
+          done
+
+      - name: Patch platform variants
+        run: |
+          cd work
+          python3 - <<'PYEOF'
+          import tarfile, json, io
+          archmap = {'ARM_V8': ('arm64', None), 'ARM_V7': ('arm', 'v7'), 'ARM_V6': ('arm', 'v6')}
+          for arch, (a, v) in archmap.items():
+              src = f'HOOC_{arch}.tar'; dst = f'patched_{arch}.tar'
+              t = tarfile.open(src, 'r')
+              data = json.loads(t.extractfile('manifest.json').read())
+              with tarfile.open(dst, 'w') as out:
+                  for m in t.getmembers():
+                      if not m.isfile():
+                          out.addfile(m); continue
+                      payload = t.extractfile(m).read()
+                      if m.name == data[0]['config']:
+                          cfg = json.loads(payload)
+                          cfg['architecture'] = a
+                          if v: cfg['variant'] = v
+                          else: cfg.pop('variant', None)
+                          payload = json.dumps(cfg, indent=2).encode()
+                          m.size = len(payload)
+                      out.addfile(m, io.BytesIO(payload))
+              print('patched', dst)
+          PYEOF
+
+      - name: Push to ghcr.io
+        env:
+          REG: ghcr.io/aseracorp/hooc-connect
+          V: ${{ github.event.inputs.version }}
+        run: |
+          cd work
+          crane auth login ghcr.io -u "${{ github.actor }}" --password-stdin <<< "${{ secrets.GITHUB_TOKEN }}"
+          crane push patched_ARM_V8.tar "$REG:arm64-$V"
+          crane push patched_ARM_V7.tar "$REG:armv7-$V"
+          crane push patched_ARM_V6.tar "$REG:armv6-$V"
+          crane index append --docker-empty-base -m "$REG:arm64-$V" -m "$REG:armv7-$V" -m "$REG:armv6-$V" -t "$REG:$V"
+          crane index append --docker-empty-base -m "$REG:arm64-$V" -m "$REG:armv7-$V" -m "$REG:armv6-$V" -t "$REG:latest"
+
+      - name: Ensure package is public
+        run: |
+          curl -sS -X PATCH \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github+json" \
+            -d '{"visibility":"public"}' \
+            "https://api.github.com/orgs/aseracorp/packages/container/hooc-connect/visibility" \
+            || echo "visibility update failed (may already be public)"
